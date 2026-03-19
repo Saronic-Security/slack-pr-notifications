@@ -20,6 +20,7 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import base64, json, os, re, sys
+          from collections import defaultdict
           from datetime import datetime, timezone
           from urllib.parse import urlparse
           from urllib.request import Request, urlopen
@@ -82,18 +83,24 @@ jobs:
               sid = info.get("slack", "")
               return f"<@{sid}>" if is_real_slack_id(sid) else None
 
-          # ── Auto-detect repo owner (top contributor) with caching ──
-          owner_cache = {}
+          def get_display_name(github_username):
+              info = users.get(github_username, {})
+              return info.get("name", github_username)
 
-          def get_repo_owner_tag(repo_name):
+          # ── Auto-detect repo owner (top contributor) with caching ──
+          owner_cache = {}  # repo_name -> (github_login, slack_tag)
+
+          def get_repo_owner(repo_name):
               if repo_name in owner_cache:
                   return owner_cache[repo_name]
-              tag = None
+              result = (None, None)
               contributors = gh_api(f"/repos/{ORG}/{repo_name}/contributors?per_page=1&anon=false")
               if contributors and isinstance(contributors, list):
-                  tag = get_slack_tag(contributors[0]["login"])
-              owner_cache[repo_name] = tag
-              return tag
+                  login = contributors[0]["login"]
+                  tag = get_slack_tag(login)
+                  result = (login, tag)
+              owner_cache[repo_name] = result
+              return result
 
           # ── Fetch all open non-draft PRs ──
           prs = []
@@ -134,11 +141,13 @@ jobs:
               print("No open PRs — skipping digest")
               sys.exit(0)
 
-          # ── Categorize PRs by age ──
+          # ── Categorize PRs by age, then by owner within each bucket ──
           now = datetime.now(timezone.utc)
-          stale = []
-          aging = []
-          fresh = []
+          # bucket_key -> owner_key -> list of (age_days, entry)
+          # bucket_key: 0=stale, 1=aging, 2=fresh
+          # owner_key: (owner_login or "_unknown", display_label)
+          buckets = {0: defaultdict(list), 1: defaultdict(list), 2: defaultdict(list)}
+          bucket_counts = {0: 0, 1: 0, 2: 0}
           repo_set = set()
 
           for pr in prs:
@@ -151,51 +160,68 @@ jobs:
               title = pr["title"]
               author = pr["user"]["login"]
               pr_url = pr.get("html_url", f"https://github.com/{ORG}/{repo}/pull/{num}")
-              owner_tag = get_repo_owner_tag(repo)
 
-              entry = f"  • <{pr_url}|{repo} #{num}> — {title} (by {author}, {age_days}d old)"
-              if owner_tag:
-                  entry += f" → {owner_tag}"
+              owner_login, owner_tag = get_repo_owner(repo)
+
+              entry = f"      \u2022 <{pr_url}|#{num}> \u2014 {title} (by {author}, {age_days}d)"
+
+              if owner_login:
+                  label = f"{owner_tag} \u2014 {repo}" if owner_tag else f"{owner_login} \u2014 {repo}"
+                  owner_key = (owner_login, label)
+              else:
+                  owner_key = ("_unknown", f"{repo}")
 
               if age_hours >= 72:
-                  stale.append((age_days, entry))
+                  buckets[0][owner_key].append((age_days, entry))
+                  bucket_counts[0] += 1
               elif age_hours >= 24:
-                  aging.append((age_days, entry))
+                  buckets[1][owner_key].append((age_days, entry))
+                  bucket_counts[1] += 1
               else:
-                  fresh.append((age_days, entry))
-
-          stale.sort(key=lambda x: -x[0])
-          aging.sort(key=lambda x: -x[0])
+                  buckets[2][owner_key].append((age_days, entry))
+                  bucket_counts[2] += 1
 
           # ── Build message ──
           today = now.strftime("%A %b %-d")
           total = len(prs)
-          lines = [f"*Daily PR Digest* — {today}", ""]
+          lines = [f"*Daily PR Digest* \u2014 {today}", ""]
 
           parts = []
-          if stale:
-              parts.append(f"*{len(stale)}* stale (3+ days)")
-          if aging:
-              parts.append(f"*{len(aging)}* aging (1-2 days)")
-          if fresh:
-              parts.append(f"*{len(fresh)}* fresh (today)")
+          if bucket_counts[0]:
+              parts.append(f"*{bucket_counts[0]}* stale (3+ days)")
+          if bucket_counts[1]:
+              parts.append(f"*{bucket_counts[1]}* aging (1\u20132 days)")
+          if bucket_counts[2]:
+              parts.append(f"*{bucket_counts[2]}* fresh (today)")
           lines.append(f"{total} open PRs across {len(repo_set)} repos: " + ", ".join(parts))
           lines.append("")
 
-          if stale:
-              lines.append(f":red_circle: *{len(stale)} PRs haven't been merged in 3+ days:*")
-              lines.extend([e for _, e in stale])
+          bucket_labels = {
+              0: (":red_circle:", "PRs haven\u2019t been merged in 3+ days"),
+              1: (":large_yellow_circle:", "PRs open 1\u20132 days"),
+              2: (":large_green_circle:", "PRs opened today"),
+          }
+
+          for bucket_key in [0, 1, 2]:
+              if not buckets[bucket_key]:
+                  continue
+              emoji, label = bucket_labels[bucket_key]
+              lines.append(f"{emoji} *{bucket_counts[bucket_key]} {label}:*")
               lines.append("")
 
-          if aging:
-              lines.append(f":large_yellow_circle: *{len(aging)} PRs open 1-2 days:*")
-              lines.extend([e for _, e in aging])
-              lines.append("")
+              # Sort owners alphabetically, _unknown last
+              sorted_owners = sorted(
+                  buckets[bucket_key].items(),
+                  key=lambda x: (x[0][0] == "_unknown", x[0][0].lower()),
+              )
 
-          if fresh:
-              lines.append(f":large_green_circle: *{len(fresh)} PRs opened today:*")
-              lines.extend([e for _, e in fresh])
-              lines.append("")
+              for (owner_login, owner_label), entries in sorted_owners:
+                  lines.append(f"    *{owner_label}*")
+                  # Sort by oldest first within each owner
+                  entries.sort(key=lambda x: -x[0])
+                  for _, entry in entries:
+                      lines.append(entry)
+                  lines.append("")
 
           if total_count > len(prs):
               lines.append(f"_Showing {len(prs)} of {total_count} (GitHub API limit)_")
