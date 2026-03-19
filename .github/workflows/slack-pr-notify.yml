@@ -25,10 +25,12 @@ jobs:
       - name: Post to Slack
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GH_TOKEN: ${{ secrets.ORG_READ_PAT }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          REPO_FULL: ${{ github.event.repository.full_name }}
           REPO_NAME: ${{ github.event.repository.name }}
           PR_ADDITIONS: ${{ github.event.pull_request.additions }}
           PR_DELETIONS: ${{ github.event.pull_request.deletions }}
@@ -41,12 +43,14 @@ jobs:
           from urllib.request import Request, urlopen
           from urllib.error import HTTPError
 
-          author   = os.environ["PR_AUTHOR"]
-          title    = os.environ["PR_TITLE"]
-          url      = os.environ["PR_URL"]
-          repo     = os.environ["REPO_NAME"]
-          webhook  = os.environ["SLACK_WEBHOOK_URL"]
-          body     = os.environ.get("PR_BODY", "") or ""
+          author    = os.environ["PR_AUTHOR"]
+          title     = os.environ["PR_TITLE"]
+          url       = os.environ["PR_URL"]
+          repo_full = os.environ["REPO_FULL"]
+          repo      = os.environ["REPO_NAME"]
+          webhook   = os.environ["SLACK_WEBHOOK_URL"]
+          gh_token  = os.environ.get("GH_TOKEN", "")
+          body      = os.environ.get("PR_BODY", "") or ""
           additions = os.environ.get("PR_ADDITIONS", "?")
           deletions = os.environ.get("PR_DELETIONS", "?")
           changed   = os.environ.get("PR_CHANGED_FILES", "?")
@@ -60,26 +64,66 @@ jobs:
           def escape_mrkdwn(s):
               return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-          # ── Load repo owner from config ──
-          owner_slack = None
+          # ── Load GitHub → Slack user map ──
+          users = {}  # github_username -> {slack, name}
           config_path = os.path.join("org-config", "repo-owners.yml")
           if os.path.exists(config_path):
               with open(config_path) as f:
                   raw = f.read()
+              in_users = False
+              current_user = None
+              for line in raw.splitlines():
+                  stripped = line.strip()
+                  if stripped.startswith("#") or not stripped:
+                      continue
+                  if stripped == "users:":
+                      in_users = True
+                      continue
+                  if in_users and not line.startswith(" ") and not line.startswith("\t"):
+                      in_users = False
+                      continue
+                  if in_users:
+                      user_match = re.match(r'^  (\S+):\s*$', line)
+                      if user_match:
+                          current_user = user_match.group(1)
+                          users[current_user] = {}
+                          continue
+                      if current_user:
+                          prop_match = re.match(r'^\s+(\w+):\s*(.+)', line)
+                          if prop_match:
+                              val = re.sub(r'\s+#.*$', '', prop_match.group(2)).strip()
+                              users[current_user][prop_match.group(1)] = val
 
-              repo_pattern = re.compile(
-                  rf'^\s+{re.escape(repo)}:\s*\n(?:^\s+\w+:.*\n)*',
-                  re.MULTILINE,
-              )
-              match = repo_pattern.search(raw)
-              if match:
-                  slack_match = re.search(r'slack:\s*(\S+)', match.group(0))
-                  if slack_match:
-                      sid = re.sub(r'\s+#.*$', '', slack_match.group(1)).strip()
-                      if re.fullmatch(r'U[A-Z0-9]{8,12}', sid) and 'XXXX' not in sid:
-                          owner_slack = sid
+          def is_real_slack_id(sid):
+              return bool(sid) and re.fullmatch(r'U[A-Z0-9]{8,12}', sid) and 'XXXX' not in sid
 
-          # ── Summarize the PR body (first meaningful line, truncated) ──
+          def get_slack_tag(github_username):
+              """Look up a GitHub username and return <@SLACK_ID> or None."""
+              info = users.get(github_username, {})
+              sid = info.get("slack", "")
+              return f"<@{sid}>" if is_real_slack_id(sid) else None
+
+          # ── Auto-detect repo owner (top contributor) ──
+          owner_tag = None
+          if gh_token:
+              try:
+                  req = Request(
+                      f"https://api.github.com/repos/{repo_full}/contributors?per_page=1&anon=false",
+                      headers={
+                          "Authorization": f"Bearer {gh_token}",
+                          "Accept": "application/vnd.github+json",
+                          "X-GitHub-Api-Version": "2022-11-28",
+                      },
+                  )
+                  with urlopen(req) as resp:
+                      contributors = json.loads(resp.read())
+                  if contributors and isinstance(contributors, list):
+                      top_contributor = contributors[0]["login"]
+                      owner_tag = get_slack_tag(top_contributor)
+              except Exception as e:
+                  print(f"Warning: could not fetch contributors: {e}", file=sys.stderr)
+
+          # ── Summarize the PR body (first meaningful line) ──
           summary = ""
           if body:
               for line in body.splitlines():
@@ -95,9 +139,8 @@ jobs:
 
           lines = []
 
-          # Tag the repo owner, or @channel if no owner
-          if owner_slack:
-              lines.append(f"<@{owner_slack}> — *{escape_mrkdwn(author)}* opened a PR on *{escape_mrkdwn(repo)}*")
+          if owner_tag:
+              lines.append(f"{owner_tag} — *{escape_mrkdwn(author)}* opened a PR on *{escape_mrkdwn(repo)}*")
           else:
               lines.append(f"<!channel> *{escape_mrkdwn(author)}* opened a PR on *{escape_mrkdwn(repo)}*")
 
