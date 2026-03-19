@@ -1,0 +1,154 @@
+name: Slack Daily PR Digest
+
+on:
+  schedule:
+    - cron: '0 14 * * *'  # 9 AM CDT (UTC-5), canonical target Mar–Nov
+                           # 8 AM CST (UTC-6) Nov–Mar — 1 hour early, accepted
+  workflow_dispatch:       # manual trigger for testing
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Fetch open PRs org-wide and post bucketed digest ──────────
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch open PRs and post digest
+        env:
+          GH_TOKEN: ${{ secrets.ORG_READ_PAT }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          # All logic in Python to avoid shell/JSON boundary issues.
+          # Secrets are passed via env vars, never interpolated into code.
+          python3 << 'PYEOF'
+          import json, os, sys, time
+          from datetime import datetime, timezone
+          from urllib.parse import urlparse
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError
+
+          GH_TOKEN      = os.environ["GH_TOKEN"]
+          SLACK_WEBHOOK = os.environ["SLACK_WEBHOOK_URL"]
+
+          # ── Fetch all open non-draft PRs via Search API (Link-header pagination) ──
+          prs = []
+          total_count = 0
+          url = (
+              "https://api.github.com/search/issues"
+              "?q=org:Saronic-Security+is:pr+is:open"
+              "&per_page=100&sort=created&order=asc"
+          )
+
+          while url:
+              req = Request(url, headers={
+                  "Authorization": f"Bearer {GH_TOKEN}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              try:
+                  with urlopen(req) as resp:
+                      data = json.loads(resp.read())
+
+                      # Detect API-level errors (rate limit, bad token, etc.)
+                      if "message" in data:
+                          # Distinguish rate limiting for clearer diagnostics
+                          if "rate limit" in data["message"].lower():
+                              print(f"Search API rate limit exceeded: {data['message']}", file=sys.stderr)
+                          else:
+                              print(f"GitHub API error: {data['message']}", file=sys.stderr)
+                          sys.exit(1)
+
+                      # Track total for 1000-result cap detection
+                      if not prs:
+                          total_count = data.get("total_count", 0)
+
+                      prs.extend(data.get("items", []))
+
+                      # Follow Link: <url>; rel="next" header for next page
+                      link_header = resp.headers.get("Link", "")
+                      url = None
+                      for part in link_header.split(","):
+                          if 'rel="next"' in part:
+                              candidate = part.split(";")[0].strip().strip("<>")
+                              # Validate pagination URL stays on api.github.com (SSRF defense)
+                              if urlparse(candidate).netloc == "api.github.com":
+                                  url = candidate
+                              else:
+                                  print(f"Ignoring non-GitHub Link URL: {candidate}", file=sys.stderr)
+
+              except HTTPError as e:
+                  if e.code == 403:
+                      print(f"HTTP 403: likely rate limited. Retry-After: {e.headers.get('Retry-After', 'unknown')}", file=sys.stderr)
+                  else:
+                      print(f"HTTP {e.code}: {e.reason}", file=sys.stderr)
+                  sys.exit(1)
+
+          # Filter out draft PRs — Search API returns pr["pull_request"]["draft"]
+          prs = [pr for pr in prs if not pr.get("pull_request", {}).get("draft", False)]
+
+          if not prs:
+              print("No open PRs — skipping digest")
+              sys.exit(0)
+
+          # ── Bucket by age ──
+          now = datetime.now(timezone.utc)
+          red, yellow, green = [], [], []
+
+          for pr in prs:
+              created = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
+              age_hours = (now - created).total_seconds() / 3600
+              repo = pr["repository_url"].split("/")[-1]
+              num = pr["number"]
+              title = pr["title"]
+              author = pr["user"]["login"]
+              age_days = int(age_hours // 24)
+              age_label = f"{age_days}d" if age_days > 0 else "<1d"
+              entry = f"  \u2022 {repo} #{num} \u2014 {title} ({author}, {age_label})"
+              if age_hours >= 72:
+                  red.append(entry)
+              elif age_hours >= 24:
+                  yellow.append(entry)
+              else:
+                  green.append(entry)
+
+          # ── Build message ──
+          today = now.strftime("%A %b %-d")
+          lines = [f"\U0001f4cb  Saronic Security \u2014 Open PRs needing review  \u2022  {today}", ""]
+
+          if red:
+              lines += ["\U0001f534  Open 3+ days"] + red + [""]
+          if yellow:
+              lines += ["\U0001f7e1  Open 1\u20132 days"] + yellow + [""]
+          if green:
+              lines += ["\U0001f7e2  Opened today"] + green + [""]
+
+          total = len(prs)
+          repos = len({pr["repository_url"] for pr in prs})
+          lines.append(f"{total} PR{'s' if total != 1 else ''} open across {repos} repo{'s' if repos != 1 else ''}")
+
+          # Warn if GitHub Search API 1000-result cap was hit
+          if total_count > len(prs):
+              lines.append(f"\u26a0\ufe0f  Showing {len(prs)} of {total_count} total (GitHub API limit)")
+
+          payload = json.dumps({"text": "\n".join(lines)})
+          print("\n".join(lines))  # log to Actions for visibility
+
+          # ── Post to Slack ──
+          req = Request(
+              SLACK_WEBHOOK,
+              data=payload.encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              with urlopen(req) as resp:
+                  body = resp.read().decode().strip()
+          except HTTPError as e:
+              print(f"Slack HTTP {e.code}: {e.reason}", file=sys.stderr)
+              sys.exit(1)
+          if body != "ok":
+              print(f"Slack error: {body}", file=sys.stderr)
+              sys.exit(1)
+          PYEOF
