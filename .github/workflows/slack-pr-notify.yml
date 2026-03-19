@@ -8,31 +8,35 @@ permissions:
   contents: read
 
 jobs:
-  # ── Notify Slack on new ready-for-review PR ────────────────────
-  # NOTE: <!channel> is intentional — spec requires @channel so all reviewers
-  # see the notification immediately.
   notify:
-    # opened + non-draft: fires when a new PR is created directly as ready
-    # ready_for_review: fires when a draft is converted to ready
     if: >-
       (github.event.action == 'opened' && github.event.pull_request.draft == false) ||
       github.event.action == 'ready_for_review'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
+      - name: Checkout org config
+        uses: actions/checkout@v4
+        with:
+          repository: Saronic-Security/.github
+          ref: main
+          path: org-config
+
       - name: Post to Slack
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_BODY: ${{ github.event.pull_request.body }}
           REPO_NAME: ${{ github.event.repository.name }}
+          PR_ADDITIONS: ${{ github.event.pull_request.additions }}
+          PR_DELETIONS: ${{ github.event.pull_request.deletions }}
+          PR_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
         run: |
-          # Build the full JSON payload in Python to safely handle any special
-          # characters in PR_TITLE, PR_AUTHOR, or PR_URL without injection risk.
-          # Uses urllib (not subprocess+curl) to avoid exposing secrets in process table.
           python3 - << 'PYEOF'
-          import json, os, sys
+          import json, os, re, sys
+          from datetime import datetime, timezone
           from urllib.parse import urlparse
           from urllib.request import Request, urlopen
           from urllib.error import HTTPError
@@ -42,22 +46,70 @@ jobs:
           url      = os.environ["PR_URL"]
           repo     = os.environ["REPO_NAME"]
           webhook  = os.environ["SLACK_WEBHOOK_URL"]
+          body     = os.environ.get("PR_BODY", "") or ""
+          additions = os.environ.get("PR_ADDITIONS", "?")
+          deletions = os.environ.get("PR_DELETIONS", "?")
+          changed   = os.environ.get("PR_CHANGED_FILES", "?")
 
-          # Validate webhook URL points to Slack (defense-in-depth)
+          # Validate webhook
           parsed = urlparse(webhook)
           if not parsed.netloc.endswith(".slack.com"):
               print(f"Webhook URL does not point to slack.com: {parsed.netloc}", file=sys.stderr)
               sys.exit(1)
 
-          # Escape Slack mrkdwn special characters to prevent phishing via crafted PR titles
           def escape_mrkdwn(s):
               return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-          safe_title  = escape_mrkdwn(title)
-          safe_author = escape_mrkdwn(author)
+          # ── Load repo owner from config ──
+          owner_slack = None
+          config_path = os.path.join("org-config", "repo-owners.yml")
+          if os.path.exists(config_path):
+              with open(config_path) as f:
+                  raw = f.read()
 
-          text = f"<!channel> *{safe_author}* opened a PR on *{repo}*\n:pencil: {safe_title}\n:link: {url}"
-          payload = json.dumps({"text": text})
+              repo_pattern = re.compile(
+                  rf'^\s+{re.escape(repo)}:\s*\n(?:^\s+\w+:.*\n)*',
+                  re.MULTILINE,
+              )
+              match = repo_pattern.search(raw)
+              if match:
+                  slack_match = re.search(r'slack:\s*(\S+)', match.group(0))
+                  if slack_match:
+                      sid = re.sub(r'\s+#.*$', '', slack_match.group(1)).strip()
+                      if re.fullmatch(r'U[A-Z0-9]{8,12}', sid) and 'XXXX' not in sid:
+                          owner_slack = sid
+
+          # ── Summarize the PR body (first meaningful line, truncated) ──
+          summary = ""
+          if body:
+              for line in body.splitlines():
+                  line = line.strip()
+                  if line and not line.startswith("#") and not line.startswith("<!--"):
+                      summary = line[:150]
+                      if len(line) > 150:
+                          summary += "..."
+                      break
+
+          # ── Build message ──
+          now = datetime.now(timezone.utc).strftime("%b %-d at %-I:%M %p UTC")
+
+          lines = []
+
+          # Tag the repo owner, or @channel if no owner
+          if owner_slack:
+              lines.append(f"<@{owner_slack}> — *{escape_mrkdwn(author)}* opened a PR on *{escape_mrkdwn(repo)}*")
+          else:
+              lines.append(f"<!channel> *{escape_mrkdwn(author)}* opened a PR on *{escape_mrkdwn(repo)}*")
+
+          lines.append(f"*{escape_mrkdwn(title)}*")
+
+          if summary:
+              lines.append(f">{escape_mrkdwn(summary)}")
+
+          lines.append(f"+{additions} / -{deletions} across {changed} file{'s' if changed != '1' else ''} • {now}")
+          lines.append(url)
+
+          payload = json.dumps({"text": "\n".join(lines)})
 
           req = Request(
               webhook,
@@ -67,13 +119,11 @@ jobs:
           )
           try:
               with urlopen(req) as resp:
-                  body = resp.read().decode().strip()
+                  resp_body = resp.read().decode().strip()
           except HTTPError as e:
               print(f"Slack HTTP {e.code}: {e.reason}", file=sys.stderr)
               sys.exit(1)
-          # Slack returns HTTP 200 even for application-level errors (e.g. bad payload)
-          # with a non-"ok" response body.
-          if body != "ok":
-              print(f"Slack error: {body}", file=sys.stderr)
+          if resp_body != "ok":
+              print(f"Slack error: {resp_body}", file=sys.stderr)
               sys.exit(1)
           PYEOF

@@ -57,7 +57,54 @@ Go to `https://github.com/organizations/Saronic-Security/settings/secrets/action
 
 **Important:** When adding each secret, set **Repository access** to **"All repositories"** (not just selected repos). If scoped too narrowly, workflows in other repos will get "secret not found" errors.
 
-## 4. Register `slack-pr-notify.yml` as a Required Workflow
+## 4. Configure Repo Owners (`repo-owners.yml`)
+
+The `repo-owners.yml` file in the `.github` repo maps each repository to its primary owner — the person with final approval authority on PRs for that repo. This drives:
+
+- **Slack notifications:** Owner is @-mentioned directly with a "you have final approval" message
+- **Daily digest:** PRs are grouped by owner so each person can see their queue
+- **CODEOWNERS sync:** Owner is added to the repo's CODEOWNERS file so GitHub branch protection requires their review
+
+### How to find Slack member IDs
+
+Slack @-mentions require member IDs (not display names). To find someone's ID:
+
+1. Open Slack → click on the person's name/profile picture
+2. Click the **three dots** (⋯) menu → **Copy member ID**
+3. Format: `U` followed by 10 alphanumeric characters (e.g., `U04ABC12DEF`)
+
+### Example config
+
+```yaml
+owners:
+  security-platform:
+    github: dustin-saronic         # GitHub username (exact match)
+    slack: U04ABC12DEF             # Slack member ID
+    name: Dustin                   # Display name for messages
+
+  pr-security-review:
+    github: dylan-saronic
+    slack: U04XYZ78GHI
+    name: Dylan
+
+fallback: channel  # "channel" = @channel, or a Slack member ID
+```
+
+### Adding a new repo owner
+
+1. Edit `repo-owners.yml` in the `Saronic-Security/.github` repo
+2. Add the repo block under `owners:` with github username, Slack member ID, and display name
+3. Commit to `main` — this automatically triggers:
+   - **CODEOWNERS sync** updates that repo's CODEOWNERS to include the new owner
+   - Next PR notification and daily digest will use the new owner
+
+### What happens for repos without an owner
+
+- **Slack notification:** Falls back to `<!channel>` (notifies everyone)
+- **Daily digest:** PRs appear under "No owner assigned" section
+- **CODEOWNERS:** Uses the base team-only CODEOWNERS (no individual owner)
+
+## 5. Register `slack-pr-notify.yml` as a Required Workflow
 
 > **Note:** GitHub has two ways to require workflows depending on your plan:
 > - **Classic (GHEC/older):** org Settings → Actions → Required workflows
@@ -75,15 +122,17 @@ Go to `https://github.com/organizations/Saronic-Security/settings/secrets/action
 After this, every PR opened in any Saronic-Security repo triggers the notification.
 `slack-pr-digest.yml` runs automatically on its cron schedule — no additional setup needed.
 
-## 5. Test It
+## 6. Test It
 
 **Test real-time notification:**
 - Open a non-draft PR in any org repo
 - Confirm Slack message appears in the team channel within ~30 seconds
+- Verify the repo owner is @-mentioned (if configured in `repo-owners.yml`)
 
 **Test daily digest manually:**
 - Go to the `.github` repo → **Actions** → **Slack Daily PR Digest** → **Run workflow**
-- Confirm digest appears in Slack (or "No open PRs — skipping digest" logged if none exist)
+- Confirm digest appears in Slack grouped by repo owner
+- Verify "No owner assigned" section appears for unmapped repos
 
 **Test draft skipping:**
 - Open a PR as draft — confirm no Slack message
@@ -92,8 +141,14 @@ After this, every PR opened in any Saronic-Security repo triggers the notificati
 **Test CODEOWNERS sync:**
 - Go to the `.github` repo → **Actions** → **Sync CODEOWNERS to All Org Repos** → **Run workflow**
 - Verify it logs `Created: X repos` and `Unchanged: Y repos`
+- Check a repo with an owner: its CODEOWNERS should include `@owner-username @Saronic-Security/security-engineering-approvers`
 
-## 6. PAT Rotation
+**Test repo owner changes:**
+- Add a new entry to `repo-owners.yml` and commit to main
+- Verify CODEOWNERS sync runs automatically
+- Open a test PR on the new repo to verify Slack notification tags the owner
+
+## 7. PAT Rotation
 
 Fine-grained PATs expire after 1 year max. Rotate before expiry:
 

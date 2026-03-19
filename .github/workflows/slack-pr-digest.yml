@@ -2,28 +2,32 @@ name: Slack Daily PR Digest
 
 on:
   schedule:
-    - cron: '0 14 * * *'  # 9 AM CDT (UTC-5), canonical target Mar–Nov
-                           # 8 AM CST (UTC-6) Nov–Mar — 1 hour early, accepted
-  workflow_dispatch:       # manual trigger for testing
+    - cron: '0 14 * * *'  # 9 AM CDT (UTC-5)
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  # ── Fetch open PRs org-wide and post bucketed digest ──────────
   digest:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Checkout org config
+        uses: actions/checkout@v4
+        with:
+          repository: Saronic-Security/.github
+          ref: main
+          path: org-config
+
       - name: Fetch open PRs and post digest
         env:
           GH_TOKEN: ${{ secrets.ORG_READ_PAT }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          # All logic in Python to avoid shell/JSON boundary issues.
-          # Secrets are passed via env vars, never interpolated into code.
           python3 << 'PYEOF'
-          import json, os, sys, time
+          import json, os, re, sys
+          from collections import defaultdict
           from datetime import datetime, timezone
           from urllib.parse import urlparse
           from urllib.request import Request, urlopen
@@ -32,12 +36,50 @@ jobs:
           GH_TOKEN      = os.environ["GH_TOKEN"]
           SLACK_WEBHOOK = os.environ["SLACK_WEBHOOK_URL"]
 
-          # ── Fetch all open non-draft PRs via Search API (Link-header pagination) ──
+          # ── Load repo-owners.yml ──
+          owners = {}  # repo_name -> {github, slack, name}
+          config_path = os.path.join("org-config", "repo-owners.yml")
+          if os.path.exists(config_path):
+              with open(config_path) as f:
+                  raw = f.read()
+              in_owners = False
+              current_repo = None
+              for line in raw.splitlines():
+                  stripped = line.strip()
+                  if stripped.startswith("#") or not stripped:
+                      continue
+                  if stripped == "owners:":
+                      in_owners = True
+                      continue
+                  if in_owners and not line.startswith(" ") and not line.startswith("\t"):
+                      in_owners = False
+                      continue
+                  if in_owners:
+                      repo_match = re.match(r'^  (\S+):\s*$', line)
+                      if repo_match:
+                          current_repo = repo_match.group(1)
+                          owners[current_repo] = {}
+                          continue
+                      if current_repo:
+                          prop_match = re.match(r'^\s+(\w+):\s*(.+)', line)
+                          if prop_match:
+                              val = re.sub(r'\s+#.*$', '', prop_match.group(2)).strip()
+                              owners[current_repo][prop_match.group(1)] = val
+
+          def get_owner_tag(repo_name):
+              """Return <@SLACK_ID> if owner exists, otherwise None."""
+              info = owners.get(repo_name, {})
+              sid = info.get("slack", "")
+              if sid and re.fullmatch(r'U[A-Z0-9]{8,12}', sid) and 'XXXX' not in sid:
+                  return f"<@{sid}>"
+              return None
+
+          # ── Fetch all open non-draft PRs ──
           prs = []
           total_count = 0
           url = (
               "https://api.github.com/search/issues"
-              "?q=org:Saronic-Security+is:pr+is:open"
+              "?q=org:Saronic-Security+is:pr+is:open+draft:false"
               "&per_page=100&sort=created&order=asc"
           )
 
@@ -50,90 +92,97 @@ jobs:
               try:
                   with urlopen(req) as resp:
                       data = json.loads(resp.read())
-
-                      # Detect API-level errors (rate limit, bad token, etc.)
                       if "message" in data:
-                          # Distinguish rate limiting for clearer diagnostics
-                          if "rate limit" in data["message"].lower():
-                              print(f"Search API rate limit exceeded: {data['message']}", file=sys.stderr)
-                          else:
-                              print(f"GitHub API error: {data['message']}", file=sys.stderr)
+                          print(f"GitHub API error: {data['message']}", file=sys.stderr)
                           sys.exit(1)
-
-                      # Track total for 1000-result cap detection
                       if not prs:
                           total_count = data.get("total_count", 0)
-
                       prs.extend(data.get("items", []))
-
-                      # Follow Link: <url>; rel="next" header for next page
                       link_header = resp.headers.get("Link", "")
                       url = None
                       for part in link_header.split(","):
                           if 'rel="next"' in part:
                               candidate = part.split(";")[0].strip().strip("<>")
-                              # Validate pagination URL stays on api.github.com (SSRF defense)
                               if urlparse(candidate).netloc == "api.github.com":
                                   url = candidate
-                              else:
-                                  print(f"Ignoring non-GitHub Link URL: {candidate}", file=sys.stderr)
-
               except HTTPError as e:
-                  if e.code == 403:
-                      print(f"HTTP 403: likely rate limited. Retry-After: {e.headers.get('Retry-After', 'unknown')}", file=sys.stderr)
-                  else:
-                      print(f"HTTP {e.code}: {e.reason}", file=sys.stderr)
+                  print(f"HTTP {e.code}: {e.reason}", file=sys.stderr)
                   sys.exit(1)
-
-          # Filter out draft PRs — Search API returns pr["pull_request"]["draft"]
-          prs = [pr for pr in prs if not pr.get("pull_request", {}).get("draft", False)]
 
           if not prs:
               print("No open PRs — skipping digest")
               sys.exit(0)
 
-          # ── Bucket by age ──
+          # ── Categorize PRs by age ──
           now = datetime.now(timezone.utc)
-          red, yellow, green = [], [], []
+          stale = []     # 3+ days
+          aging = []     # 1-2 days
+          fresh = []     # <1 day
+          repo_set = set()
 
           for pr in prs:
               created = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
               age_hours = (now - created).total_seconds() / 3600
+              age_days = int(age_hours // 24)
               repo = pr["repository_url"].split("/")[-1]
+              repo_set.add(repo)
               num = pr["number"]
               title = pr["title"]
               author = pr["user"]["login"]
-              age_days = int(age_hours // 24)
-              age_label = f"{age_days}d" if age_days > 0 else "<1d"
-              entry = f"  \u2022 {repo} #{num} \u2014 {title} ({author}, {age_label})"
+              pr_url = pr.get("html_url", f"https://github.com/Saronic-Security/{repo}/pull/{num}")
+              owner_tag = get_owner_tag(repo)
+
+              entry = f"  • <{pr_url}|{repo} #{num}> — {title} (by {author}, {age_days}d old)"
+              if owner_tag:
+                  entry += f" → {owner_tag}"
+
               if age_hours >= 72:
-                  red.append(entry)
+                  stale.append((age_days, entry))
               elif age_hours >= 24:
-                  yellow.append(entry)
+                  aging.append((age_days, entry))
               else:
-                  green.append(entry)
+                  fresh.append((age_days, entry))
+
+          # Sort stale/aging by oldest first
+          stale.sort(key=lambda x: -x[0])
+          aging.sort(key=lambda x: -x[0])
 
           # ── Build message ──
           today = now.strftime("%A %b %-d")
-          lines = [f"\U0001f4cb  Saronic Security \u2014 Open PRs needing review  \u2022  {today}", ""]
-
-          if red:
-              lines += ["\U0001f534  Open 3+ days"] + red + [""]
-          if yellow:
-              lines += ["\U0001f7e1  Open 1\u20132 days"] + yellow + [""]
-          if green:
-              lines += ["\U0001f7e2  Opened today"] + green + [""]
-
           total = len(prs)
-          repos = len({pr["repository_url"] for pr in prs})
-          lines.append(f"{total} PR{'s' if total != 1 else ''} open across {repos} repo{'s' if repos != 1 else ''}")
+          lines = [f"*Daily PR Digest* — {today}", ""]
 
-          # Warn if GitHub Search API 1000-result cap was hit
+          # Lead with the headline numbers
+          parts = []
+          if stale:
+              parts.append(f"*{len(stale)}* stale (3+ days)")
+          if aging:
+              parts.append(f"*{len(aging)}* aging (1-2 days)")
+          if fresh:
+              parts.append(f"*{len(fresh)}* fresh (today)")
+          lines.append(f"{total} open PRs across {len(repo_set)} repos: " + ", ".join(parts))
+          lines.append("")
+
+          if stale:
+              lines.append(f":red_circle: *{len(stale)} PRs haven't been merged in 3+ days:*")
+              lines.extend([e for _, e in stale])
+              lines.append("")
+
+          if aging:
+              lines.append(f":large_yellow_circle: *{len(aging)} PRs open 1-2 days:*")
+              lines.extend([e for _, e in aging])
+              lines.append("")
+
+          if fresh:
+              lines.append(f":large_green_circle: *{len(fresh)} PRs opened today:*")
+              lines.extend([e for _, e in fresh])
+              lines.append("")
+
           if total_count > len(prs):
-              lines.append(f"\u26a0\ufe0f  Showing {len(prs)} of {total_count} total (GitHub API limit)")
+              lines.append(f"_Showing {len(prs)} of {total_count} (GitHub API limit)_")
 
           payload = json.dumps({"text": "\n".join(lines)})
-          print("\n".join(lines))  # log to Actions for visibility
+          print("\n".join(lines))
 
           # ── Post to Slack ──
           req = Request(
