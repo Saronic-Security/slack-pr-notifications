@@ -30,7 +30,7 @@ jobs:
           PR_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
         run: |
           python3 - << 'PYEOF'
-          import json, os, re, sys
+          import base64, json, os, re, sys
           from datetime import datetime, timezone
           from urllib.parse import urlparse
           from urllib.request import Request, urlopen
@@ -48,7 +48,6 @@ jobs:
           deletions = os.environ.get("PR_DELETIONS", "?")
           changed   = os.environ.get("PR_CHANGED_FILES", "?")
 
-          # Validate webhook
           parsed = urlparse(webhook)
           if not parsed.netloc.endswith(".slack.com"):
               print(f"Webhook URL does not point to slack.com: {parsed.netloc}", file=sys.stderr)
@@ -58,7 +57,6 @@ jobs:
               return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
           def gh_api(path):
-              """Fetch from GitHub API, return parsed JSON or None on error."""
               if not gh_token:
                   return None
               try:
@@ -76,11 +74,10 @@ jobs:
                   print(f"Warning: GitHub API error for {path}: {e}", file=sys.stderr)
                   return None
 
-          # ── Load GitHub → Slack user map via API (no checkout needed) ──
+          # ── Load GitHub → Slack user map via API ──
           users = {}
           raw = gh_api("/repos/Saronic-Security/.github/contents/repo-owners.yml")
           if raw and raw.get("content"):
-              import base64
               content = base64.b64decode(raw["content"]).decode()
               in_users = False
               current_user = None
@@ -127,30 +124,88 @@ jobs:
               for line in body.splitlines():
                   line = line.strip()
                   if line and not line.startswith("#") and not line.startswith("<!--"):
-                      summary = line[:150]
-                      if len(line) > 150:
+                      summary = line[:200]
+                      if len(line) > 200:
                           summary += "..."
                       break
 
-          # ── Build message ──
-          now = datetime.now(timezone.utc).strftime("%b %-d at %-I:%M %p UTC")
+          # ── Build Block Kit payload ──
+          safe_author = escape_mrkdwn(author)
+          safe_title = escape_mrkdwn(title)
+          safe_repo = escape_mrkdwn(repo)
+          file_word = "file" if changed == "1" else "files"
 
-          lines = []
+          blocks = []
 
-          if owner_tag:
-              lines.append(f"{owner_tag} — *{escape_mrkdwn(author)}* opened a PR on *{escape_mrkdwn(repo)}*")
-          else:
-              lines.append(f"<!channel> *{escape_mrkdwn(author)}* opened a PR on *{escape_mrkdwn(repo)}*")
+          # Header — repo name with lightning bolt
+          blocks.append({
+              "type": "section",
+              "text": {
+                  "type": "mrkdwn",
+                  "text": f":zap: *{safe_repo}*",
+              },
+          })
 
-          lines.append(f"*{escape_mrkdwn(title)}*")
+          # Author → title
+          blocks.append({
+              "type": "section",
+              "text": {
+                  "type": "mrkdwn",
+                  "text": f"{safe_author}  →  *{safe_title}*",
+              },
+          })
 
+          # Summary quote (if PR has a body)
           if summary:
-              lines.append(f">{escape_mrkdwn(summary)}")
+              blocks.append({
+                  "type": "section",
+                  "text": {
+                      "type": "mrkdwn",
+                      "text": f">{escape_mrkdwn(summary)}",
+                  },
+              })
 
-          lines.append(f"+{additions} / -{deletions} across {changed} file{'s' if changed != '1' else ''} • {now}")
-          lines.append(url)
+          # Stats line + button
+          stats = f"`+{additions}` `-{deletions}` · {changed} {file_word}"
 
-          payload = json.dumps({"text": "\n".join(lines)})
+          blocks.append({
+              "type": "section",
+              "text": {
+                  "type": "mrkdwn",
+                  "text": stats,
+              },
+              "accessory": {
+                  "type": "button",
+                  "text": {
+                      "type": "plain_text",
+                      "text": "View PR",
+                      "emoji": True,
+                  },
+                  "url": url,
+                  "style": "primary",
+              },
+          })
+
+          # Owner mention as context at the bottom
+          if owner_tag:
+              mention = owner_tag
+          else:
+              mention = "<!channel>"
+
+          blocks.append({
+              "type": "context",
+              "elements": [
+                  {
+                      "type": "mrkdwn",
+                      "text": f"{mention} · {repo_full}",
+                  },
+              ],
+          })
+
+          # Fallback text for notifications/previews
+          fallback = f"{author} opened a PR on {repo}: {title}"
+
+          payload = json.dumps({"text": fallback, "blocks": blocks})
 
           req = Request(
               webhook,
