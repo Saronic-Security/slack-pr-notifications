@@ -15,14 +15,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      - name: Checkout org config
-        uses: actions/checkout@v4
-        with:
-          repository: Saronic-Security/.github
-          ref: main
-          path: org-config
-          token: ${{ secrets.ORG_READ_PAT }}
-
       - name: Post to Slack
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
@@ -65,15 +57,34 @@ jobs:
           def escape_mrkdwn(s):
               return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-          # ── Load GitHub → Slack user map ──
-          users = {}  # github_username -> {slack, name}
-          config_path = os.path.join("org-config", "repo-owners.yml")
-          if os.path.exists(config_path):
-              with open(config_path) as f:
-                  raw = f.read()
+          def gh_api(path):
+              """Fetch from GitHub API, return parsed JSON or None on error."""
+              if not gh_token:
+                  return None
+              try:
+                  req = Request(
+                      f"https://api.github.com{path}",
+                      headers={
+                          "Authorization": f"Bearer {gh_token}",
+                          "Accept": "application/vnd.github+json",
+                          "X-GitHub-Api-Version": "2022-11-28",
+                      },
+                  )
+                  with urlopen(req) as resp:
+                      return json.loads(resp.read())
+              except Exception as e:
+                  print(f"Warning: GitHub API error for {path}: {e}", file=sys.stderr)
+                  return None
+
+          # ── Load GitHub → Slack user map via API (no checkout needed) ──
+          users = {}
+          raw = gh_api("/repos/Saronic-Security/.github/contents/repo-owners.yml")
+          if raw and raw.get("content"):
+              import base64
+              content = base64.b64decode(raw["content"]).decode()
               in_users = False
               current_user = None
-              for line in raw.splitlines():
+              for line in content.splitlines():
                   stripped = line.strip()
                   if stripped.startswith("#") or not stripped:
                       continue
@@ -99,30 +110,16 @@ jobs:
               return bool(sid) and re.fullmatch(r'U[A-Z0-9]{8,12}', sid) and 'XXXX' not in sid
 
           def get_slack_tag(github_username):
-              """Look up a GitHub username and return <@SLACK_ID> or None."""
               info = users.get(github_username, {})
               sid = info.get("slack", "")
               return f"<@{sid}>" if is_real_slack_id(sid) else None
 
           # ── Auto-detect repo owner (top contributor) ──
           owner_tag = None
-          if gh_token:
-              try:
-                  req = Request(
-                      f"https://api.github.com/repos/{repo_full}/contributors?per_page=1&anon=false",
-                      headers={
-                          "Authorization": f"Bearer {gh_token}",
-                          "Accept": "application/vnd.github+json",
-                          "X-GitHub-Api-Version": "2022-11-28",
-                      },
-                  )
-                  with urlopen(req) as resp:
-                      contributors = json.loads(resp.read())
-                  if contributors and isinstance(contributors, list):
-                      top_contributor = contributors[0]["login"]
-                      owner_tag = get_slack_tag(top_contributor)
-              except Exception as e:
-                  print(f"Warning: could not fetch contributors: {e}", file=sys.stderr)
+          contributors = gh_api(f"/repos/{repo_full}/contributors?per_page=1&anon=false")
+          if contributors and isinstance(contributors, list):
+              top = contributors[0]["login"]
+              owner_tag = get_slack_tag(top)
 
           # ── Summarize the PR body (first meaningful line) ──
           summary = ""

@@ -13,21 +13,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Checkout org config
-        uses: actions/checkout@v4
-        with:
-          repository: Saronic-Security/.github
-          ref: main
-          path: org-config
-          token: ${{ secrets.ORG_READ_PAT }}
-
       - name: Fetch open PRs and post digest
         env:
           GH_TOKEN: ${{ secrets.ORG_READ_PAT }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           python3 << 'PYEOF'
-          import json, os, re, sys
+          import base64, json, os, re, sys
           from datetime import datetime, timezone
           from urllib.parse import urlparse
           from urllib.request import Request, urlopen
@@ -37,15 +29,30 @@ jobs:
           SLACK_WEBHOOK = os.environ["SLACK_WEBHOOK_URL"]
           ORG           = "Saronic-Security"
 
-          # ── Load GitHub → Slack user map ──
-          users = {}  # github_username -> {slack, name}
-          config_path = os.path.join("org-config", "repo-owners.yml")
-          if os.path.exists(config_path):
-              with open(config_path) as f:
-                  raw = f.read()
+          def gh_api(path):
+              try:
+                  req = Request(
+                      f"https://api.github.com{path}",
+                      headers={
+                          "Authorization": f"Bearer {GH_TOKEN}",
+                          "Accept": "application/vnd.github+json",
+                          "X-GitHub-Api-Version": "2022-11-28",
+                      },
+                  )
+                  with urlopen(req) as resp:
+                      return json.loads(resp.read())
+              except Exception as e:
+                  print(f"Warning: GitHub API error for {path}: {e}", file=sys.stderr)
+                  return None
+
+          # ── Load GitHub → Slack user map via API ──
+          users = {}
+          raw = gh_api("/repos/Saronic-Security/.github/contents/repo-owners.yml")
+          if raw and raw.get("content"):
+              content = base64.b64decode(raw["content"]).decode()
               in_users = False
               current_user = None
-              for line in raw.splitlines():
+              for line in content.splitlines():
                   stripped = line.strip()
                   if stripped.startswith("#") or not stripped:
                       continue
@@ -76,27 +83,15 @@ jobs:
               return f"<@{sid}>" if is_real_slack_id(sid) else None
 
           # ── Auto-detect repo owner (top contributor) with caching ──
-          owner_cache = {}  # repo_name -> slack_tag or None
+          owner_cache = {}
 
           def get_repo_owner_tag(repo_name):
               if repo_name in owner_cache:
                   return owner_cache[repo_name]
               tag = None
-              try:
-                  req = Request(
-                      f"https://api.github.com/repos/{ORG}/{repo_name}/contributors?per_page=1&anon=false",
-                      headers={
-                          "Authorization": f"Bearer {GH_TOKEN}",
-                          "Accept": "application/vnd.github+json",
-                          "X-GitHub-Api-Version": "2022-11-28",
-                      },
-                  )
-                  with urlopen(req) as resp:
-                      contributors = json.loads(resp.read())
-                  if contributors and isinstance(contributors, list):
-                      tag = get_slack_tag(contributors[0]["login"])
-              except Exception as e:
-                  print(f"Warning: could not fetch contributors for {repo_name}: {e}", file=sys.stderr)
+              contributors = gh_api(f"/repos/{ORG}/{repo_name}/contributors?per_page=1&anon=false")
+              if contributors and isinstance(contributors, list):
+                  tag = get_slack_tag(contributors[0]["login"])
               owner_cache[repo_name] = tag
               return tag
 
@@ -141,9 +136,9 @@ jobs:
 
           # ── Categorize PRs by age ──
           now = datetime.now(timezone.utc)
-          stale = []     # 3+ days
-          aging = []     # 1-2 days
-          fresh = []     # <1 day
+          stale = []
+          aging = []
+          fresh = []
           repo_set = set()
 
           for pr in prs:
