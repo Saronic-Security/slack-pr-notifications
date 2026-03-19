@@ -19,6 +19,7 @@ jobs:
           repository: Saronic-Security/.github
           ref: main
           path: org-config
+          token: ${{ secrets.ORG_READ_PAT }}
 
       - name: Fetch open PRs and post digest
         env:

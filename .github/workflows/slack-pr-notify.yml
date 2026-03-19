@@ -21,6 +21,7 @@ jobs:
           repository: Saronic-Security/.github
           ref: main
           path: org-config
+          token: ${{ secrets.ORG_READ_PAT }}
 
       - name: Post to Slack
         env:
