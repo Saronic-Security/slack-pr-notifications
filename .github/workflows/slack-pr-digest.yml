@@ -143,12 +143,13 @@ jobs:
 
           # ── Categorize PRs by age, then by owner within each bucket ──
           now = datetime.now(timezone.utc)
-          # bucket_key -> owner_key -> list of (age_days, entry)
-          # bucket_key: 0=stale, 1=aging, 2=fresh
-          # owner_key: (owner_login or "_unknown", display_label)
           buckets = {0: defaultdict(list), 1: defaultdict(list), 2: defaultdict(list)}
           bucket_counts = {0: 0, 1: 0, 2: 0}
           repo_set = set()
+
+          # Track per-owner stats for callouts (stale PRs only — 3+ days)
+          # owner_login -> {tag, count, oldest_days, repos}
+          owner_stale_stats = defaultdict(lambda: {"tag": None, "count": 0, "oldest": 0, "repos": set()})
 
           for pr in prs:
               created = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
@@ -174,6 +175,13 @@ jobs:
               if age_hours >= 72:
                   buckets[0][owner_key].append((age_days, entry))
                   bucket_counts[0] += 1
+                  # Track stale stats per owner
+                  if owner_login and owner_login != "_unknown":
+                      stats = owner_stale_stats[owner_login]
+                      stats["tag"] = owner_tag
+                      stats["count"] += 1
+                      stats["oldest"] = max(stats["oldest"], age_days)
+                      stats["repos"].add(repo)
               elif age_hours >= 24:
                   buckets[1][owner_key].append((age_days, entry))
                   bucket_counts[1] += 1
@@ -195,6 +203,19 @@ jobs:
               parts.append(f"*{bucket_counts[2]}* fresh (today)")
           lines.append(f"{total} open PRs across {len(repo_set)} repos: " + ", ".join(parts))
           lines.append("")
+
+          # ── Callouts for owners with 3+ stale PRs ──
+          callouts = sorted(
+              [(login, s) for login, s in owner_stale_stats.items() if s["count"] >= 3],
+              key=lambda x: -x[1]["count"],
+          )
+          if callouts:
+              for login, s in callouts:
+                  tag = s["tag"] if s["tag"] else login
+                  repo_count = len(s["repos"])
+                  repo_word = "repo" if repo_count == 1 else "repos"
+                  lines.append(f":warning: {tag} \u2014 *{s['count']} PRs* waiting across {repo_count} {repo_word}, oldest is *{s['oldest']}d*")
+              lines.append("")
 
           bucket_labels = {
               0: (":red_circle:", "PRs haven\u2019t been merged in 3+ days"),
