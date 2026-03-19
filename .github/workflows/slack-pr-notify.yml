@@ -2,13 +2,13 @@ name: Slack PR Notification
 
 on:
   pull_request:
-    types: [opened, ready_for_review]
+    types: [opened, ready_for_review, closed]
 
 permissions:
   contents: read
 
 jobs:
-  notify:
+  notify-opened:
     if: >-
       (github.event.action == 'opened' && github.event.pull_request.draft == false) ||
       github.event.action == 'ready_for_review'
@@ -31,7 +31,6 @@ jobs:
         run: |
           python3 - << 'PYEOF'
           import base64, json, os, re, sys
-          from datetime import datetime, timezone
           from urllib.parse import urlparse
           from urllib.request import Request, urlopen
           from urllib.error import HTTPError
@@ -118,7 +117,7 @@ jobs:
               top = contributors[0]["login"]
               owner_tag = get_slack_tag(top)
 
-          # ── Summarize the PR body (first meaningful line) ──
+          # ── Summarize the PR body ──
           summary = ""
           if body:
               for line in body.splitlines():
@@ -137,82 +136,134 @@ jobs:
 
           blocks = []
 
-          # Header — repo name with lightning bolt
           blocks.append({
               "type": "section",
-              "text": {
-                  "type": "mrkdwn",
-                  "text": f":zap: *{safe_repo}*",
-              },
+              "text": {"type": "mrkdwn", "text": f":zap: *{safe_repo}*"},
           })
 
-          # Author → title
           blocks.append({
               "type": "section",
-              "text": {
-                  "type": "mrkdwn",
-                  "text": f"{safe_author}  →  *{safe_title}*",
-              },
+              "text": {"type": "mrkdwn", "text": f"{safe_author}  \u2192  *{safe_title}*"},
           })
 
-          # Summary quote (if PR has a body)
           if summary:
               blocks.append({
                   "type": "section",
-                  "text": {
-                      "type": "mrkdwn",
-                      "text": f">{escape_mrkdwn(summary)}",
-                  },
+                  "text": {"type": "mrkdwn", "text": f">{escape_mrkdwn(summary)}"},
               })
-
-          # Stats line + button
-          stats = f"`+{additions}` `-{deletions}` · {changed} {file_word}"
 
           blocks.append({
               "type": "section",
-              "text": {
-                  "type": "mrkdwn",
-                  "text": stats,
-              },
+              "text": {"type": "mrkdwn", "text": f"`+{additions}` `-{deletions}` \u00b7 {changed} {file_word}"},
               "accessory": {
                   "type": "button",
-                  "text": {
-                      "type": "plain_text",
-                      "text": "View PR",
-                      "emoji": True,
-                  },
+                  "text": {"type": "plain_text", "text": "View PR", "emoji": True},
                   "url": url,
                   "style": "primary",
               },
           })
 
-          # Owner mention as context at the bottom
-          if owner_tag:
-              mention = owner_tag
-          else:
-              mention = "<!channel>"
+          mention = owner_tag if owner_tag else "<!channel>"
+          blocks.append({
+              "type": "context",
+              "elements": [{"type": "mrkdwn", "text": f"{mention} \u00b7 {repo_full}"}],
+          })
+
+          fallback = f"{author} opened a PR on {repo}: {title}"
+          payload = json.dumps({"text": fallback, "blocks": blocks})
+
+          req = Request(webhook, data=payload.encode(), headers={"Content-Type": "application/json"}, method="POST")
+          try:
+              with urlopen(req) as resp:
+                  resp_body = resp.read().decode().strip()
+          except HTTPError as e:
+              print(f"Slack HTTP {e.code}: {e.reason}", file=sys.stderr)
+              sys.exit(1)
+          if resp_body != "ok":
+              print(f"Slack error: {resp_body}", file=sys.stderr)
+              sys.exit(1)
+          PYEOF
+
+  notify-merged:
+    if: >-
+      github.event.action == 'closed' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Post merge notification to Slack
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          PR_MERGED_BY: ${{ github.event.pull_request.merged_by.login }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          REPO_FULL: ${{ github.event.repository.full_name }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          PR_ADDITIONS: ${{ github.event.pull_request.additions }}
+          PR_DELETIONS: ${{ github.event.pull_request.deletions }}
+          PR_COMMITS: ${{ github.event.pull_request.commits }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 - << 'PYEOF'
+          import json, os, sys
+          from urllib.parse import urlparse
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError
+
+          merged_by = os.environ["PR_MERGED_BY"]
+          title     = os.environ["PR_TITLE"]
+          url       = os.environ["PR_URL"]
+          repo_full = os.environ["REPO_FULL"]
+          repo      = os.environ["REPO_NAME"]
+          webhook   = os.environ["SLACK_WEBHOOK_URL"]
+          additions = os.environ.get("PR_ADDITIONS", "?")
+          deletions = os.environ.get("PR_DELETIONS", "?")
+          commits   = os.environ.get("PR_COMMITS", "?")
+          pr_num    = os.environ.get("PR_NUMBER", "?")
+
+          parsed = urlparse(webhook)
+          if not parsed.netloc.endswith(".slack.com"):
+              print(f"Webhook URL does not point to slack.com: {parsed.netloc}", file=sys.stderr)
+              sys.exit(1)
+
+          def escape_mrkdwn(s):
+              return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+          safe_merged_by = escape_mrkdwn(merged_by)
+          safe_title = escape_mrkdwn(title)
+          safe_repo = escape_mrkdwn(repo)
+          commit_word = "commit" if commits == "1" else "commits"
+
+          blocks = []
+
+          blocks.append({
+              "type": "section",
+              "text": {"type": "mrkdwn", "text": f":white_check_mark: *{safe_repo}*"},
+          })
+
+          blocks.append({
+              "type": "section",
+              "text": {"type": "mrkdwn", "text": f"{safe_merged_by} merged *{safe_title}*"},
+          })
+
+          blocks.append({
+              "type": "section",
+              "text": {"type": "mrkdwn", "text": f"{commits} {commit_word} \u00b7 `+{additions}` `-{deletions}`"},
+              "accessory": {
+                  "type": "button",
+                  "text": {"type": "plain_text", "text": "View PR", "emoji": True},
+                  "url": url,
+              },
+          })
 
           blocks.append({
               "type": "context",
-              "elements": [
-                  {
-                      "type": "mrkdwn",
-                      "text": f"{mention} · {repo_full}",
-                  },
-              ],
+              "elements": [{"type": "mrkdwn", "text": f"{repo_full} #{pr_num}"}],
           })
 
-          # Fallback text for notifications/previews
-          fallback = f"{author} opened a PR on {repo}: {title}"
-
+          fallback = f"{merged_by} merged #{pr_num} on {repo}: {title}"
           payload = json.dumps({"text": fallback, "blocks": blocks})
 
-          req = Request(
-              webhook,
-              data=payload.encode(),
-              headers={"Content-Type": "application/json"},
-              method="POST",
-          )
+          req = Request(webhook, data=payload.encode(), headers={"Content-Type": "application/json"}, method="POST")
           try:
               with urlopen(req) as resp:
                   resp_body = resp.read().decode().strip()
